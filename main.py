@@ -5,8 +5,10 @@ import hmac
 import json
 
 # ----------------- CONFIG -----------------
-API_KEY = "Mz75LCYjux76NbmRH08a0XUnMRribH"
-API_SECRET = "jSwTn8bVs6IT2SyRgVHfI8m4U1ueudSrRGMpVpEhjHnUJ4Ne9KVHWKirZND6"
+import os
+
+API_KEY = os.environ.get("API_KEY")
+API_SECRET = os.environ.get("API_SECRET")
 BASE_URL = "https://cdn-ind.testnet.deltaex.org"
 PRODUCT_ID = 84   # BTCUSD Perpetual
 ORDER_SIZE = 1    # contracts per trade
