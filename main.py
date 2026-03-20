@@ -14,7 +14,6 @@ PRODUCT_ID = 84   # BTCUSD Perpetual
 ORDER_SIZE = 1    # contracts per trade
 
 # ----------------- POSITION STATE -----------------
-# We track position in memory
 # None = no position, "LONG" = bought, "SHORT" = sold
 current_position = None
 
@@ -57,28 +56,13 @@ def place_order(side, size=ORDER_SIZE):
     }
     print(f"📤 Placing {side.upper()} order — {size} contract(s)")
     result = make_request("POST", "/v2/orders", body)
-    
+
     if result.get("success"):
         fill_price = result["result"].get("average_fill_price", "N/A")
         print(f"✅ Order filled at price: {fill_price}")
     else:
         print(f"❌ Order failed: {result}")
-    
-    return result
 
-# ----------------- CLOSE POSITION -----------------
-def close_position():
-    global current_position
-
-    if current_position is None:
-        print("ℹ️ No open position to close")
-        return
-
-    close_side = "sell" if current_position == "LONG" else "buy"
-    print(f"⚠️ Closing {current_position} position with {close_side.upper()}")
-    
-    result = place_order(close_side, ORDER_SIZE)
-    current_position = None
     return result
 
 # ----------------- BUY LOGIC -----------------
@@ -90,10 +74,13 @@ def buy():
         return
 
     if current_position == "SHORT":
-        print("🔄 Reversing SHORT → LONG")
-        close_position()
+        # Use size 2: 1 to close SHORT + 1 to open LONG (single order)
+        print("🔄 Reversing SHORT → LONG (single order, size 2)")
+        result = place_order("buy", ORDER_SIZE * 2)
+    else:
+        # No position, just open LONG with size 1
+        result = place_order("buy", ORDER_SIZE)
 
-    result = place_order("buy")
     current_position = "LONG"
     print(f"🟢 Position is now: LONG")
     return result
@@ -107,10 +94,13 @@ def sell():
         return
 
     if current_position == "LONG":
-        print("🔄 Reversing LONG → SHORT")
-        close_position()
+        # Use size 2: 1 to close LONG + 1 to open SHORT (single order)
+        print("🔄 Reversing LONG → SHORT (single order, size 2)")
+        result = place_order("sell", ORDER_SIZE * 2)
+    else:
+        # No position, just open SHORT with size 1
+        result = place_order("sell", ORDER_SIZE)
 
-    result = place_order("sell")
     current_position = "SHORT"
     print(f"🔴 Position is now: SHORT")
     return result
