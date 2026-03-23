@@ -10,7 +10,7 @@ API_KEY    = os.environ.get("API_KEY")
 API_SECRET = os.environ.get("API_SECRET")
 
 # !! LIVE ACCOUNT -- REAL MONEY !!
-BASE_URL   = "https://cdn-ind.deltaex.org"      # LIVE endpoint
+BASE_URL = "https://api.india.delta.exchange"      # LIVE endpoint
 PRODUCT_ID = 84                                  # BTCUSD Perpetual
 
 # ----------------- POSITION SIZING (10x LEVERAGE) -----------------
