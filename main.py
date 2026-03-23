@@ -16,28 +16,18 @@ PRODUCT_ID = 84       # BTCUSD Perpetual
 # !! TESTNET ONLY -- DO NOT USE ON LIVE ACCOUNT !!
 #
 # Capital          : $195 USD (testnet balance)
-# Leverage         : 100x
-# BTC price (approx): $71,000
-# 1 contract value : $71 (0.001 BTC notional)
-# Margin/contract  : $0.71 (at 100x)
+# Leverage         : 100x (must be set manually on Delta Exchange UI)
+# 1 contract value : ~$71 (0.001 BTC notional at ~$71,000 BTC)
+# Margin/contract  : $0.71 at 100x
 #
-# ORDER_SIZE = 137 contracts
-#   -> Notional value  : $9,727  (137 x $71)
-#   -> Margin used     : $97.27  (50% of capital per trade)
-#   -> Fee per trade   : $5.16   (0.053% taker)
-#   -> Reversal order  : 274 contracts (uses ~100% capital -- safe max)
-#   -> Reversal margin : $194.54 (stays within $195 capital)
-#   -> Liq buffer      : $97.73  on a normal trade
+# ORDER_SIZE = 50 (safe starting point to confirm orders work)
+# Once confirmed working, increase back to 137
 #
-# Why 137 and not more?
-#   On a reversal (closing + opening = 2x order), margin doubles.
-#   137 x 2 = 274 contracts -> $194.54 margin -> just fits in $195.
-#   Going above 137 would make reversal orders exceed capital -> liquidation risk.
+# To change size: update ORDER_SIZE below and push to GitHub
 
-ORDER_SIZE = 137      # contracts per trade -- max safe for $195 at 100x
+ORDER_SIZE = 50       # start here to confirm orders work, then increase to 137
 
 # ----------------- POSITION STATE -----------------
-# None = no position, "LONG" = long open, "SHORT" = short open
 current_position = None
 
 # ----------------- SIGNATURE -----------------
@@ -62,12 +52,24 @@ def make_request(method, path, body=None):
         "Content-Type": "application/json"
     }
 
-    if method == "POST":
-        response = requests.post(BASE_URL + path, headers=headers, data=body_str)
-    else:
-        response = requests.get(BASE_URL + path, headers=headers)
+    try:
+        if method == "POST":
+            response = requests.post(BASE_URL + path, headers=headers, data=body_str, timeout=10)
+        else:
+            response = requests.get(BASE_URL + path, headers=headers, timeout=10)
 
-    return response.json()
+        print(f"🌐 HTTP {response.status_code} from Delta Exchange")
+        return response.json()
+
+    except requests.exceptions.Timeout:
+        print("❌ ERROR: Request timed out — Delta Exchange did not respond in 10s")
+        return {}
+    except requests.exceptions.ConnectionError as e:
+        print(f"❌ ERROR: Connection failed — {e}")
+        return {}
+    except Exception as e:
+        print(f"❌ ERROR: Unexpected error — {e}")
+        return {}
 
 # ----------------- PLACE ORDER -----------------
 def place_order(side, size=ORDER_SIZE):
@@ -79,15 +81,23 @@ def place_order(side, size=ORDER_SIZE):
     }
     notional = round(size * 71, 2)
     margin   = round(size * 0.71, 2)
-    print(f"📤 Placing {side.upper()} | {size} contracts | Notional: ~${notional} | Margin: ~${margin}")
+    print(f"📤 Placing {side.upper()} | {size} contracts | Notional ~${notional} | Margin ~${margin}")
+    print(f"📦 Request body: {json.dumps(body)}")
 
     result = make_request("POST", "/v2/orders", body)
+
+    print(f"📨 Full response: {result}")   # print full response always
 
     if result.get("success"):
         fill_price = result["result"].get("average_fill_price", "N/A")
         print(f"✅ Filled at: {fill_price}")
+    elif result:
+        error = result.get("error", {})
+        code  = error.get("code", "unknown")
+        ctx   = error.get("context", {})
+        print(f"❌ Order failed — code: {code} | context: {ctx}")
     else:
-        print(f"❌ Order failed: {result}")
+        print("❌ Empty response from Delta Exchange")
 
     return result
 
@@ -100,15 +110,14 @@ def buy():
         return
 
     if current_position == "SHORT":
-        # Single order: 2x size closes SHORT + opens LONG
-        print("🔄 Reversing SHORT → LONG (274 contracts, ~$194.54 margin)")
+        print(f"🔄 Reversing SHORT → LONG ({ORDER_SIZE * 2} contracts)")
         result = place_order("buy", ORDER_SIZE * 2)
     else:
-        print("🟢 Opening LONG (137 contracts, ~$97.27 margin)")
+        print(f"🟢 Opening LONG ({ORDER_SIZE} contracts)")
         result = place_order("buy", ORDER_SIZE)
 
     current_position = "LONG"
-    print(f"📊 Position: LONG | {ORDER_SIZE} contracts | Notional: ~${ORDER_SIZE * 71}")
+    print(f"📊 Position: LONG | {ORDER_SIZE} contracts")
     return result
 
 # ----------------- SELL LOGIC -----------------
@@ -120,15 +129,14 @@ def sell():
         return
 
     if current_position == "LONG":
-        # Single order: 2x size closes LONG + opens SHORT
-        print("🔄 Reversing LONG → SHORT (274 contracts, ~$194.54 margin)")
+        print(f"🔄 Reversing LONG → SHORT ({ORDER_SIZE * 2} contracts)")
         result = place_order("sell", ORDER_SIZE * 2)
     else:
-        print("🔴 Opening SHORT (137 contracts, ~$97.27 margin)")
+        print(f"🔴 Opening SHORT ({ORDER_SIZE} contracts)")
         result = place_order("sell", ORDER_SIZE)
 
     current_position = "SHORT"
-    print(f"📊 Position: SHORT | {ORDER_SIZE} contracts | Notional: ~${ORDER_SIZE * 71}")
+    print(f"📊 Position: SHORT | {ORDER_SIZE} contracts")
     return result
 
 # ----------------- SIGNAL HANDLER -----------------
@@ -137,8 +145,15 @@ def handle_signal(signal):
     print(f"\n{'='*50}")
     print(f"📩 Signal   : {signal}")
     print(f"📊 Position : {current_position}")
-    print(f"💰 Capital  : $195 | Leverage: 100x | Size: {ORDER_SIZE} contracts")
+    print(f"💰 Size     : {ORDER_SIZE} contracts | Leverage: 100x")
+    print(f"🔑 API Key  : {API_KEY[:8]}..." if API_KEY else "❌ API_KEY is missing!")
+    print(f"🔑 Secret   : {'SET' if API_SECRET else '❌ MISSING'}")
     print(f"{'='*50}")
+
+    if not API_KEY or not API_SECRET:
+        print("❌ CRITICAL: API_KEY or API_SECRET environment variable is not set!")
+        print("   Go to Render → Environment → add API_KEY and API_SECRET")
+        return
 
     if "BUY" in signal:
         buy()
@@ -146,4 +161,3 @@ def handle_signal(signal):
         sell()
     else:
         print(f"⚠️ Unknown signal: '{signal}'")
-        print("   Valid signals: BUY | SELL")
