@@ -12,35 +12,9 @@ BASE_URL   = "https://api.india.delta.exchange"  # LIVE endpoint
 PRODUCT_ID = 27                                   # BTCUSD Perpetual (live)
 
 # ----------------- POSITION SIZING (10x LEVERAGE) -----------------
-#
-# !! LIVE ACCOUNT -- REAL MONEY !!
-#
-# Capital            : Rs.10,000 (~$107.30 at Rs.93.2/USD)
-# Leverage           : 10x  (set manually on Delta Exchange UI)
-# BTC price (approx) : ~$70,500
-# 1 contract value   : $70.50  (0.001 BTC notional)
-# Margin/contract    : $7.05   at 10x
-#
-# ORDER_SIZE = 6 contracts
-#   -> Notional value      : $423.00  (~Rs.39,424)
-#   -> Margin per trade    : $42.30   (39.4% of capital)
-#   -> Reversal margin     : $84.60   (78.8% of capital)
-#   -> Liquidation trigger : 10% BTC move against you (very safe)
-#   -> Fee per trade       : $0.2496  (~Rs.23.26)
-#   -> Round trip fee      : $0.4991  (~Rs.46.52)
-#   -> Monthly fees        : Rs.2,047
-#
-# PROFIT POTENTIAL per winning trade:
-#   BTC moves 0.5% -> +Rs.151
-#   BTC moves 1.0% -> +Rs.348
-#
-# MONTHLY at 60% win rate -> +Rs.2,151
-
 ORDER_SIZE = 6
 
 # ----------------- POSITION STATE -----------------
-# Synced from Delta API on every startup so server restarts
-# never cause duplicate or wrong trades.
 current_position = None
 
 # ----------------- SIGNATURE -----------------
@@ -142,19 +116,21 @@ def get_free_balance():
         print(f"⚠️ Balance fetch failed: {e}")
     return None
 
-# ----------------- PLACE ORDER -----------------
-def place_order(side, size=ORDER_SIZE):
+# ----------------- PLACE ORDER (single direction) -----------------
+def place_order(side, size=ORDER_SIZE, reduce_only=False):
     body = {
-        "product_id": PRODUCT_ID,
-        "order_type": "market_order",
+        "product_id":  PRODUCT_ID,
+        "order_type":  "market_order",
         "side":        side,
-        "size":        size
+        "size":        size,
+        "reduce_only": reduce_only        # ← KEY: True = close only, never overshoots
     }
     notional = round(size * 70.5, 2)
     margin   = round(size * 7.05, 2)
     fee_est  = round(notional * 0.00059, 4)
+    label    = "CLOSE" if reduce_only else "OPEN"
     print(
-        f"📤 {side.upper()} | {size} contracts | "
+        f"📤 [{label}] {side.upper()} | {size} contracts | "
         f"Notional ~${notional} | Margin ~${margin} | Est. fee ~${fee_est}"
     )
 
@@ -165,18 +141,18 @@ def place_order(side, size=ORDER_SIZE):
         fill_price = r.get("average_fill_price", "N/A")
         commission = r.get("paid_commission", "N/A")
         pnl        = r.get("meta_data", {}).get("pnl", "0")
-        print(f"✅ Filled at: {fill_price} | PnL: {pnl} | Commission: {commission}")
+        print(f"✅ [{label}] Filled at: {fill_price} | PnL: {pnl} | Commission: {commission}")
     elif result:
         error = result.get("error", {})
         code  = error.get("code", "unknown")
         ctx   = error.get("context", {})
-        print(f"❌ Failed — {code}")
+        print(f"❌ [{label}] Failed — {code}")
         if code == "insufficient_margin":
             print(f"💡 Free: ${ctx.get('available_balance','?')} | Extra needed: ${ctx.get('required_additional_balance','?')}")
         elif code == "ip_not_whitelisted_for_api_key":
             print(f"💡 Add {ctx.get('client_ip')} to API key whitelist on Delta")
     else:
-        print("❌ Empty response from Delta Exchange")
+        print(f"❌ [{label}] Empty response from Delta Exchange")
 
     return result
 
@@ -188,18 +164,28 @@ def buy():
         print("🟢 Already LONG — skipping duplicate signal")
         return
 
+    # Step 1: Close existing SHORT first (reduce_only=True is safest)
     if current_position == "SHORT":
-        print(f"🔄 Reversing SHORT → LONG ({ORDER_SIZE * 2} contracts)")
-        result = place_order("buy", ORDER_SIZE * 2)
-    else:
-        print(f"🟢 Opening LONG ({ORDER_SIZE} contracts)")
-        result = place_order("buy", ORDER_SIZE)
+        print(f"🔄 Step 1/2 — Closing SHORT ({ORDER_SIZE} contracts)...")
+        close_result = place_order("buy", ORDER_SIZE, reduce_only=True)
+
+        if not close_result.get("success"):
+            print("⚠️ Close SHORT failed — aborting. Re-syncing from Delta...")
+            sync_position_from_exchange()
+            return
+
+        print("✅ SHORT closed successfully")
+        time.sleep(0.5)   # small pause so exchange registers the close
+
+    # Step 2: Open new LONG
+    print(f"🟢 Step 2/2 — Opening LONG ({ORDER_SIZE} contracts)...")
+    result = place_order("buy", ORDER_SIZE, reduce_only=False)
 
     if result and result.get("success"):
         current_position = "LONG"
         print(f"📊 Position: LONG | {ORDER_SIZE} contracts | Liq trigger: BTC -10%")
     else:
-        print("⚠️ Order failed — re-syncing from Delta...")
+        print("⚠️ Open LONG failed — re-syncing from Delta...")
         sync_position_from_exchange()
 
     return result
@@ -212,18 +198,28 @@ def sell():
         print("🔴 Already SHORT — skipping duplicate signal")
         return
 
+    # Step 1: Close existing LONG first (reduce_only=True is safest)
     if current_position == "LONG":
-        print(f"🔄 Reversing LONG → SHORT ({ORDER_SIZE * 2} contracts)")
-        result = place_order("sell", ORDER_SIZE * 2)
-    else:
-        print(f"🔴 Opening SHORT ({ORDER_SIZE} contracts)")
-        result = place_order("sell", ORDER_SIZE)
+        print(f"🔄 Step 1/2 — Closing LONG ({ORDER_SIZE} contracts)...")
+        close_result = place_order("sell", ORDER_SIZE, reduce_only=True)
+
+        if not close_result.get("success"):
+            print("⚠️ Close LONG failed — aborting. Re-syncing from Delta...")
+            sync_position_from_exchange()
+            return
+
+        print("✅ LONG closed successfully")
+        time.sleep(0.5)   # small pause so exchange registers the close
+
+    # Step 2: Open new SHORT
+    print(f"🔴 Step 2/2 — Opening SHORT ({ORDER_SIZE} contracts)...")
+    result = place_order("sell", ORDER_SIZE, reduce_only=False)
 
     if result and result.get("success"):
         current_position = "SHORT"
         print(f"📊 Position: SHORT | {ORDER_SIZE} contracts | Liq trigger: BTC +10%")
     else:
-        print("⚠️ Order failed — re-syncing from Delta...")
+        print("⚠️ Open SHORT failed — re-syncing from Delta...")
         sync_position_from_exchange()
 
     return result
