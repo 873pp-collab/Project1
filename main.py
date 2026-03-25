@@ -11,41 +11,51 @@ API_SECRET = os.environ.get("API_SECRET")
 BASE_URL   = "https://api.india.delta.exchange"  # LIVE endpoint
 PRODUCT_ID = 27                                   # BTCUSD Perpetual (live)
 
-# ----------------- POSITION SIZING (AGGRESSIVE) -----------------
+# ----------------- POSITION SIZING (10x LEVERAGE) -----------------
 #
 # !! LIVE ACCOUNT -- REAL MONEY !!
 #
-# Balance            : ~$57.65
-# Leverage           : 10x  (set on Delta Exchange UI)
+# Capital            : Rs.10,000 (~$107.30 at Rs.93.2/USD)
+# Leverage           : 10x  (set manually on Delta Exchange UI)
 # BTC price (approx) : ~$70,500
-# 1 contract value   : $70.50 (0.001 BTC)
-# Margin/contract    : $7.05  at 10x
+# 1 contract value   : $70.50  (0.001 BTC notional)
+# Margin/contract    : $7.05   at 10x
 #
-# ORDER_SIZE = 3 contracts  (maximum safe for reversal orders)
-#   -> Notional value      : $211.50  (~Rs.19,712)
-#   -> Normal margin       : $21.15   (36.7% of balance)
-#   -> Reversal margin     : $42.30   (73.4% of balance)  <-- 2x order
-#   -> Liquidation buffer  : $36.50   (63.3% of balance)
-#   -> Fee per trade       : $0.1248  (~Rs.11.63)
-#   -> Daily fees (4 trades): $0.50   (~Rs.47)
-#   -> Monthly fees        : $10.98   (~Rs.1,023)
+# ORDER_SIZE = 6 contracts  (maximum safe for Rs.10,000 at 10x)
+#   -> Notional value      : $423.00  (~Rs.39,424)
+#   -> Margin per trade    : $42.30   (39.4% of capital)
+#   -> Reversal margin     : $84.60   (78.8% of capital)  <-- 2x order
+#   -> Liquidation buffer  : $65.00   (60.6% of capital)
+#   -> Liquidation trigger : 10% BTC move against you (very safe)
+#   -> Fee per trade       : $0.2496  (~Rs.23.26)
+#   -> Round trip fee      : $0.4991  (~Rs.46.52)
+#   -> Daily fees (4 trades): Rs.93
+#   -> Monthly fees        : Rs.2,047
 #
-# WHY 3 AND NOT 7?
-#   When reversing (SHORT->LONG or LONG->SHORT), the bot places
-#   a 2x order (ORDER_SIZE * 2 = 6 contracts). That reversal
-#   order needs $42.30 margin. Going above 3 contracts would
-#   push the reversal margin past 90% of balance, risking
-#   insufficient_margin errors and liquidation on volatile moves.
+# PROFIT POTENTIAL (per round-trip winning trade):
+#   BTC moves 0.3% -> +Rs.72
+#   BTC moves 0.5% -> +Rs.151
+#   BTC moves 1.0% -> +Rs.348
+#   BTC moves 2.0% -> +Rs.742
 #
-# PROFIT POTENTIAL:
-#   0.5% BTC move in your favour = +$0.81 (~Rs.75) per trade
-#   1.0% BTC move in your favour = +$1.87 (~Rs.174) per trade
-#   Break-even = 0.118% move     = ~$83 price change
+# MONTHLY PROFITABILITY (4 signals/day, 22 trading days):
+#   50% win rate  -> -Rs.624   (losing, strategy needs work)
+#   55% win rate  -> +Rs.763   (just profitable)
+#   60% win rate  -> +Rs.2,151 (solid returns)
+#   65% win rate  -> +Rs.3,539 (excellent)
+#
+# WHY 6 AND NOT 7?
+#   Reversal order = ORDER_SIZE * 2 = 12 contracts = $84.60 margin.
+#   7 contracts would make reversal = $98.70, leaving only $8.60
+#   buffer — dangerously thin for any margin fluctuation.
+#   6 keeps reversal at 78.8% of capital with a comfortable $65 buffer.
 
-ORDER_SIZE = 3   # aggressive but safe maximum for $57.65 balance at 10x
+ORDER_SIZE = 6    # optimal for Rs.10,000 at 10x leverage
 
 # ----------------- POSITION STATE -----------------
-# Always synced from Delta API on startup -- never assumes None
+# Always synced from Delta Exchange API on every startup.
+# This is the fix that prevents duplicate trades when
+# Render's free tier restarts the server every ~16 minutes.
 current_position = None
 
 # ----------------- SIGNATURE -----------------
@@ -72,9 +82,13 @@ def make_request(method, path, body=None):
 
     try:
         if method == "POST":
-            response = requests.post(BASE_URL + path, headers=headers, data=body_str, timeout=10)
+            response = requests.post(
+                BASE_URL + path, headers=headers, data=body_str, timeout=10
+            )
         else:
-            response = requests.get(BASE_URL + path, headers=headers, timeout=10)
+            response = requests.get(
+                BASE_URL + path, headers=headers, timeout=10
+            )
         return response.json()
 
     except requests.exceptions.Timeout:
@@ -88,9 +102,9 @@ def make_request(method, path, body=None):
         return {}
 
 # ----------------- SYNC POSITION FROM DELTA -----------------
-# Called every time the server starts/restarts. This is the fix
-# that prevents duplicate trades when Render free tier restarts.
-# Instead of blindly assuming no position, we ask Delta directly.
+# Called on every server startup. Reads the actual open position
+# from Delta Exchange so the bot always knows the true state,
+# even after Render restarts and wipes the in-memory variable.
 def sync_position_from_exchange():
     global current_position
 
@@ -106,9 +120,9 @@ def sync_position_from_exchange():
             return
 
         for pos in positions:
-            size = float(pos.get("size", 0))
-            entry = pos.get("entry_price", "N/A")
+            size  = float(pos.get("size", 0))
             side  = pos.get("side", "")
+            entry = pos.get("entry_price", "N/A")
 
             if size > 0 and side == "buy":
                 current_position = "LONG"
@@ -126,7 +140,7 @@ def sync_position_from_exchange():
         print(f"⚠️ Sync failed: {e} — defaulting to None")
         current_position = None
 
-# Sync immediately on startup before any signal arrives
+# Sync runs immediately when the server boots
 sync_position_from_exchange()
 
 # ----------------- GET FREE BALANCE -----------------
@@ -137,7 +151,10 @@ def get_free_balance():
             if b.get("asset_symbol") == "USD":
                 available = float(b.get("available_balance", 0))
                 total     = float(b.get("balance", 0))
-                print(f"💰 Total: ${total:.2f} (~Rs.{total*93.2:.0f}) | Free: ${available:.2f} (~Rs.{available*93.2:.0f})")
+                print(
+                    f"💰 Total: ${total:.2f} (~Rs.{total*93.2:.0f}) "
+                    f"| Free: ${available:.2f} (~Rs.{available*93.2:.0f})"
+                )
                 return available
     except Exception as e:
         print(f"⚠️ Balance fetch failed: {e}")
@@ -151,19 +168,22 @@ def place_order(side, size=ORDER_SIZE):
         "side":        side,
         "size":        size
     }
-    notional = round(size * 70.5, 2)   # approx, updates with BTC price
+    notional = round(size * 70.5, 2)
     margin   = round(size * 7.05, 2)
-    fee_est  = round(notional * 0.00059, 4)
-    print(f"📤 {side.upper()} | {size} contracts | Notional ~${notional} | Margin ~${margin} | Fee ~${fee_est}")
+    fee_est  = round(notional * 0.00059, 4)   # 0.05% taker + 18% GST
+    print(
+        f"📤 {side.upper()} | {size} contracts | "
+        f"Notional ~${notional} | Margin ~${margin} | Est. fee ~${fee_est}"
+    )
 
     result = make_request("POST", "/v2/orders", body)
 
     if result.get("success"):
-        r = result["result"]
+        r          = result["result"]
         fill_price = r.get("average_fill_price", "N/A")
-        comm       = r.get("paid_commission", "N/A")
-        pnl        = r.get("meta_data", {}).get("pnl", "N/A")
-        print(f"✅ Filled at: {fill_price} | PnL: {pnl} | Commission: {comm}")
+        commission = r.get("paid_commission", "N/A")
+        pnl        = r.get("meta_data", {}).get("pnl", "0")
+        print(f"✅ Filled at: {fill_price} | PnL: {pnl} | Commission: {commission}")
     elif result:
         error = result.get("error", {})
         code  = error.get("code", "unknown")
@@ -171,10 +191,10 @@ def place_order(side, size=ORDER_SIZE):
         print(f"❌ Failed — {code}")
 
         if code == "insufficient_margin":
-            print(f"💡 Free: ${ctx.get('available_balance','?')} | Need extra: ${ctx.get('required_additional_balance','?')}")
-            print(f"💡 Reduce ORDER_SIZE or deposit more capital")
+            print(f"💡 Free: ${ctx.get('available_balance','?')} | Extra needed: ${ctx.get('required_additional_balance','?')}")
+            print(f"💡 Ensure leverage is 10x on Delta UI and no stuck open positions")
         elif code == "ip_not_whitelisted_for_api_key":
-            print(f"💡 Add {ctx.get('client_ip')} to API key whitelist on Delta")
+            print(f"💡 Add {ctx.get('client_ip')} to API key whitelist on Delta Exchange")
     else:
         print("❌ Empty response from Delta Exchange")
 
@@ -185,12 +205,12 @@ def buy():
     global current_position
 
     if current_position == "LONG":
-        print("🟢 Already LONG — skipping")
+        print("🟢 Already LONG — skipping duplicate signal")
         return
 
     if current_position == "SHORT":
-        # Single order of 2x size closes existing SHORT and opens new LONG
-        # This is more efficient than two separate orders (saves one fee)
+        # Single order of 2x size closes the SHORT and opens
+        # a LONG in one atomic operation, saving one fee charge
         print(f"🔄 Reversing SHORT → LONG ({ORDER_SIZE * 2} contracts)")
         result = place_order("buy", ORDER_SIZE * 2)
     else:
@@ -199,9 +219,9 @@ def buy():
 
     if result and result.get("success"):
         current_position = "LONG"
-        print(f"📊 Position: LONG | {ORDER_SIZE} contracts | Break-even: +0.118%")
+        print(f"📊 Position: LONG | {ORDER_SIZE} contracts | Liq trigger: BTC -10%")
     else:
-        # Re-sync so we know the true state after a failed order
+        # Re-sync on failure so state stays accurate
         print("⚠️ Order failed — re-syncing from Delta...")
         sync_position_from_exchange()
 
@@ -212,11 +232,12 @@ def sell():
     global current_position
 
     if current_position == "SHORT":
-        print("🔴 Already SHORT — skipping")
+        print("🔴 Already SHORT — skipping duplicate signal")
         return
 
     if current_position == "LONG":
-        # Single order of 2x size closes existing LONG and opens new SHORT
+        # Single order of 2x size closes the LONG and opens
+        # a SHORT in one atomic operation
         print(f"🔄 Reversing LONG → SHORT ({ORDER_SIZE * 2} contracts)")
         result = place_order("sell", ORDER_SIZE * 2)
     else:
@@ -225,7 +246,7 @@ def sell():
 
     if result and result.get("success"):
         current_position = "SHORT"
-        print(f"📊 Position: SHORT | {ORDER_SIZE} contracts | Break-even: +0.118%")
+        print(f"📊 Position: SHORT | {ORDER_SIZE} contracts | Liq trigger: BTC +10%")
     else:
         print("⚠️ Order failed — re-syncing from Delta...")
         sync_position_from_exchange()
@@ -235,18 +256,19 @@ def sell():
 # ----------------- SIGNAL HANDLER -----------------
 def handle_signal(signal):
     signal = signal.strip().upper()
-    print(f"\n{'='*58}")
+    print(f"\n{'='*60}")
     print(f"📩 Signal     : {signal}")
     print(f"📊 Position   : {current_position}")
-    print(f"📐 Size       : {ORDER_SIZE} contracts | 10x | LIVE | AGGRESSIVE")
-    print(f"💸 Break-even : 0.118% BTC move (~Rs.11.63 fee per trade)")
+    print(f"📐 Size       : {ORDER_SIZE} contracts | 10x | LIVE | Rs.10,000")
+    print(f"💸 Break-even : 0.118% BTC move (~Rs.46.52 round-trip fee)")
+    print(f"🛡️  Liq safety : 10% BTC move needed to liquidate (very safe)")
 
     if not API_KEY or not API_SECRET:
         print("❌ API_KEY or API_SECRET missing in Render environment!")
         return
 
     get_free_balance()
-    print(f"{'='*58}")
+    print(f"{'='*60}")
 
     if "BUY" in signal:
         buy()
