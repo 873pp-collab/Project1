@@ -12,7 +12,7 @@ BASE_URL   = "https://api.india.delta.exchange"
 PRODUCT_ID = 27  # BTCUSD Perpetual (live)
 
 # ----------------- POSITION SIZING -----------------
-ORDER_SIZE = 7
+ORDER_SIZE = 9
 
 # ----------------- POSITION STATE -----------------
 current_position = None
@@ -51,20 +51,14 @@ def make_request(method, path, body=None):
 
         print(f"🌐 HTTP {response.status_code} | {method} {path}")
 
-        # Always print first 500 chars of raw body so we can debug
-        raw_text = response.text
-        print(f"📥 Raw response: {raw_text[:500]}")
-
-        # Guard: parse JSON safely
         try:
             data = response.json()
         except Exception as e:
-            print(f"⚠️ JSON parse failed: {e}")
+            print(f"⚠️ JSON parse failed: {e} | Raw: {response.text[:300]}")
             return {}
 
-        # Guard: must be a dict
         if not isinstance(data, dict):
-            print(f"⚠️ Response is not a dict, got {type(data)}: {str(data)[:300]}")
+            print(f"⚠️ Response not a dict, got {type(data)}: {str(data)[:300]}")
             return {}
 
         return data
@@ -81,6 +75,14 @@ def make_request(method, path, body=None):
 
 # ----------------- SYNC POSITION FROM DELTA -----------------
 def sync_position_from_exchange():
+    """
+    Delta /v2/positions returns:
+      {"success": true, "result": {"size": 7,  "entry_price": "68666.5"}}  -> LONG  (size > 0)
+      {"success": true, "result": {"size": -7, "entry_price": "68666.5"}}  -> SHORT (size < 0)
+      {"success": true, "result": {}}                                        -> FLAT  (no position)
+      {"success": true, "result": []}                                        -> FLAT  (no position)
+    Size is POSITIVE for long, NEGATIVE for short — there is no "side" field.
+    """
     global current_position
 
     print("🔄 Syncing position from Delta Exchange...")
@@ -90,57 +92,75 @@ def sync_position_from_exchange():
         current_position = None
         return
 
-    # Retry up to 3x — cold boot network may not be ready
     for attempt in range(1, 4):
         result = make_request("GET", f"/v2/positions?product_id={PRODUCT_ID}")
 
         if not result:
-            print(f"⚠️ Sync attempt {attempt}/3 got empty dict — retrying in 3s...")
+            print(f"⚠️ Sync attempt {attempt}/3 got empty response — retrying in 3s...")
             time.sleep(3)
             continue
 
-        # Check for API-level errors
         if not result.get("success", False):
-            print(f"⚠️ API returned success=false: {result}")
+            print(f"⚠️ API success=false on attempt {attempt}/3: {result}")
             time.sleep(3)
             continue
 
         try:
-            raw = result.get("result", [])
-            print(f"📋 Positions raw result: {raw}")
+            raw = result.get("result", {})
+            print(f"📋 Raw position result: {raw}")
 
-            # Flat account: result can be {}, [], or None
+            # Flat: empty dict, empty list, or None
             if not raw:
                 current_position = None
                 print("📊 Synced: No open position (flat)")
                 return
 
-            # Normalise: could be a single dict or a list
-            positions = raw if isinstance(raw, list) else [raw]
+            # Delta returns a single dict for this product_id query
+            # Extract size — positive = LONG, negative = SHORT, 0 = flat
+            if isinstance(raw, dict):
+                size = float(raw.get("size", 0))
+                entry = raw.get("entry_price", "N/A")
 
-            matched = False
-            for pos in positions:
-                if not isinstance(pos, dict):
-                    continue
-                size  = float(pos.get("size", 0))
-                side  = pos.get("side", "")
-                entry = pos.get("entry_price", "N/A")
-
-                if size > 0 and side == "buy":
+                if size > 0:
                     current_position = "LONG"
                     print(f"📊 Synced: LONG | size={size} contracts | entry={entry}")
-                    matched = True
                     return
-                elif size > 0 and side == "sell":
+                elif size < 0:
                     current_position = "SHORT"
-                    print(f"📊 Synced: SHORT | size={size} contracts | entry={entry}")
-                    matched = True
+                    print(f"📊 Synced: SHORT | size={abs(size)} contracts | entry={entry}")
+                    return
+                else:
+                    current_position = None
+                    print("📊 Synced: No open position (size=0, flat)")
                     return
 
-            if not matched:
+            # Fallback: list format (older API versions)
+            if isinstance(raw, list):
+                if not raw:
+                    current_position = None
+                    print("📊 Synced: No open position (flat)")
+                    return
+
+                for pos in raw:
+                    if not isinstance(pos, dict):
+                        continue
+                    size  = float(pos.get("size", 0))
+                    entry = pos.get("entry_price", "N/A")
+                    # Try "side" field first, fall back to size sign
+                    side  = pos.get("side", "")
+
+                    if side == "buy" or (not side and size > 0):
+                        current_position = "LONG"
+                        print(f"📊 Synced: LONG | size={size} contracts | entry={entry}")
+                        return
+                    elif side == "sell" or (not side and size < 0):
+                        current_position = "SHORT"
+                        print(f"📊 Synced: SHORT | size={abs(size)} contracts | entry={entry}")
+                        return
+
                 current_position = None
                 print("📊 Synced: No open position (flat)")
-            return
+                return
 
         except Exception as e:
             print(f"⚠️ Sync parse error on attempt {attempt}/3: {e}")
@@ -211,72 +231,88 @@ def place_order(side, size=ORDER_SIZE, reduce_only=False):
 
     return result
 
-# ----------------- BUY LOGIC -----------------
+# ----------------- BUY SIGNAL LOGIC -----------------
+#
+# Scenario A: Already LONG       → skip (duplicate signal, do nothing)
+# Scenario B: Currently SHORT    → close SHORT first, then open LONG
+# Scenario C: Flat (no position) → open LONG directly
+#
 def buy():
     global current_position
 
-    # Always re-sync from exchange — never trust in-memory state after restart
+    # Always fetch real position from exchange before deciding
     sync_position_from_exchange()
 
+    # ── Scenario A ───────────────────────────────────────────────────────────
     if current_position == "LONG":
-        print("🟢 Already LONG — skipping duplicate signal")
+        print("🟢 [SKIP] Already LONG — BUY signal ignored (no duplicate trade)")
         return
 
+    # ── Scenario B ───────────────────────────────────────────────────────────
     if current_position == "SHORT":
-        print(f"🔄 Step 1/2 — Closing SHORT ({ORDER_SIZE} contracts)...")
+        print(f"🔄 [BUY] Currently SHORT → closing SHORT first ({ORDER_SIZE} contracts)...")
         close_result = place_order("buy", ORDER_SIZE, reduce_only=True)
 
         if not close_result.get("success"):
-            print("⚠️ Close SHORT failed — aborting open. Re-syncing...")
+            print("⚠️ [BUY] Close SHORT FAILED — aborting, NOT opening LONG. Re-syncing...")
             sync_position_from_exchange()
             return
 
-        print("✅ SHORT closed")
-        time.sleep(0.5)
+        print("✅ [BUY] SHORT closed successfully")
+        time.sleep(0.5)  # let exchange settle before next order
 
-    print(f"🟢 Opening LONG ({ORDER_SIZE} contracts)...")
+    # ── Scenario C (and continuation of B) ───────────────────────────────────
+    print(f"🟢 [BUY] Opening LONG ({ORDER_SIZE} contracts)...")
     result = place_order("buy", ORDER_SIZE, reduce_only=False)
 
     if result and result.get("success"):
         current_position = "LONG"
-        print(f"📊 Position: LONG | {ORDER_SIZE} contracts | Liq trigger: BTC -10%")
+        print(f"📊 [BUY] Done — Position: LONG | {ORDER_SIZE} contracts | Liq trigger: BTC -10%")
     else:
-        print("⚠️ Open LONG failed — re-syncing...")
+        print("⚠️ [BUY] Open LONG FAILED — re-syncing to get real state...")
         sync_position_from_exchange()
 
     return result
 
-# ----------------- SELL LOGIC -----------------
+# ----------------- SELL SIGNAL LOGIC -----------------
+#
+# Scenario A: Already SHORT      → skip (duplicate signal, do nothing)
+# Scenario B: Currently LONG     → close LONG first, then open SHORT
+# Scenario C: Flat (no position) → open SHORT directly
+#
 def sell():
     global current_position
 
-    # Always re-sync from exchange — never trust in-memory state after restart
+    # Always fetch real position from exchange before deciding
     sync_position_from_exchange()
 
+    # ── Scenario A ───────────────────────────────────────────────────────────
     if current_position == "SHORT":
-        print("🔴 Already SHORT — skipping duplicate signal")
+        print("🔴 [SKIP] Already SHORT — SELL signal ignored (no duplicate trade)")
         return
 
+    # ── Scenario B ───────────────────────────────────────────────────────────
     if current_position == "LONG":
-        print(f"🔄 Step 1/2 — Closing LONG ({ORDER_SIZE} contracts)...")
+        print(f"🔄 [SELL] Currently LONG → closing LONG first ({ORDER_SIZE} contracts)...")
         close_result = place_order("sell", ORDER_SIZE, reduce_only=True)
 
         if not close_result.get("success"):
-            print("⚠️ Close LONG failed — aborting open. Re-syncing...")
+            print("⚠️ [SELL] Close LONG FAILED — aborting, NOT opening SHORT. Re-syncing...")
             sync_position_from_exchange()
             return
 
-        print("✅ LONG closed")
-        time.sleep(0.5)
+        print("✅ [SELL] LONG closed successfully")
+        time.sleep(0.5)  # let exchange settle before next order
 
-    print(f"🔴 Opening SHORT ({ORDER_SIZE} contracts)...")
+    # ── Scenario C (and continuation of B) ───────────────────────────────────
+    print(f"🔴 [SELL] Opening SHORT ({ORDER_SIZE} contracts)...")
     result = place_order("sell", ORDER_SIZE, reduce_only=False)
 
     if result and result.get("success"):
         current_position = "SHORT"
-        print(f"📊 Position: SHORT | {ORDER_SIZE} contracts | Liq trigger: BTC +10%")
+        print(f"📊 [SELL] Done — Position: SHORT | {ORDER_SIZE} contracts | Liq trigger: BTC +10%")
     else:
-        print("⚠️ Open SHORT failed — re-syncing...")
+        print("⚠️ [SELL] Open SHORT FAILED — re-syncing to get real state...")
         sync_position_from_exchange()
 
     return result
