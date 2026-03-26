@@ -49,18 +49,22 @@ def make_request(method, path, body=None):
                 BASE_URL + path, headers=headers, timeout=10
             )
 
-        # CRITICAL FIX: response.json() can raise if body is not valid JSON
-        # (HTML error page, empty body on 5xx, etc). Always guard it and
-        # print raw text so we can see what Delta actually returned.
+        print(f"🌐 HTTP {response.status_code} | {method} {path}")
+
+        # Always print first 500 chars of raw body so we can debug
+        raw_text = response.text
+        print(f"📥 Raw response: {raw_text[:500]}")
+
+        # Guard: parse JSON safely
         try:
             data = response.json()
-        except Exception:
-            print(f"⚠️ Non-JSON response [{response.status_code}]: {response.text[:300]}")
+        except Exception as e:
+            print(f"⚠️ JSON parse failed: {e}")
             return {}
 
-        # Must be a dict — if Delta ever returns a list or string, catch it
+        # Guard: must be a dict
         if not isinstance(data, dict):
-            print(f"⚠️ Unexpected response type {type(data)}: {str(data)[:300]}")
+            print(f"⚠️ Response is not a dict, got {type(data)}: {str(data)[:300]}")
             return {}
 
         return data
@@ -81,27 +85,40 @@ def sync_position_from_exchange():
 
     print("🔄 Syncing position from Delta Exchange...")
 
-    # Retry up to 3x — cold boot / network may not be ready instantly
+    if not API_KEY or not API_SECRET:
+        print("❌ API_KEY or API_SECRET not set — cannot sync!")
+        current_position = None
+        return
+
+    # Retry up to 3x — cold boot network may not be ready
     for attempt in range(1, 4):
         result = make_request("GET", f"/v2/positions?product_id={PRODUCT_ID}")
 
         if not result:
-            print(f"⚠️ Sync attempt {attempt}/3 got empty response — retrying in 2s...")
-            time.sleep(2)
+            print(f"⚠️ Sync attempt {attempt}/3 got empty dict — retrying in 3s...")
+            time.sleep(3)
+            continue
+
+        # Check for API-level errors
+        if not result.get("success", False):
+            print(f"⚠️ API returned success=false: {result}")
+            time.sleep(3)
             continue
 
         try:
             raw = result.get("result", [])
+            print(f"📋 Positions raw result: {raw}")
 
-            # Flat account: result is {}, [], or None
+            # Flat account: result can be {}, [], or None
             if not raw:
                 current_position = None
                 print("📊 Synced: No open position (flat)")
                 return
 
-            # Normalise: Delta sometimes returns a single dict instead of a list
+            # Normalise: could be a single dict or a list
             positions = raw if isinstance(raw, list) else [raw]
 
+            matched = False
             for pos in positions:
                 if not isinstance(pos, dict):
                     continue
@@ -112,23 +129,26 @@ def sync_position_from_exchange():
                 if size > 0 and side == "buy":
                     current_position = "LONG"
                     print(f"📊 Synced: LONG | size={size} contracts | entry={entry}")
+                    matched = True
                     return
                 elif size > 0 and side == "sell":
                     current_position = "SHORT"
                     print(f"📊 Synced: SHORT | size={size} contracts | entry={entry}")
+                    matched = True
                     return
 
-            current_position = None
-            print("📊 Synced: No open position (flat)")
+            if not matched:
+                current_position = None
+                print("📊 Synced: No open position (flat)")
             return
 
         except Exception as e:
             print(f"⚠️ Sync parse error on attempt {attempt}/3: {e}")
-            print(f"   Raw result was: {str(result)[:300]}")
-            time.sleep(2)
+            print(f"   Full result: {result}")
+            time.sleep(3)
 
-    print("❌ Sync failed after 3 attempts — defaulting to None")
-    print("   ⚠️ Check your API key, secret, and IP whitelist on Delta Exchange!")
+    print("❌ Sync failed after 3 attempts — position set to None")
+    print("   ⚠️ Check API key, secret, and IP whitelist on Delta Exchange!")
     current_position = None
 
 # Runs immediately when server boots
@@ -195,14 +215,13 @@ def place_order(side, size=ORDER_SIZE, reduce_only=False):
 def buy():
     global current_position
 
-    # Always re-sync from exchange before acting — never trust in-memory state alone
+    # Always re-sync from exchange — never trust in-memory state after restart
     sync_position_from_exchange()
 
     if current_position == "LONG":
         print("🟢 Already LONG — skipping duplicate signal")
         return
 
-    # Step 1: Close existing SHORT (reduce_only = never accidentally add to position)
     if current_position == "SHORT":
         print(f"🔄 Step 1/2 — Closing SHORT ({ORDER_SIZE} contracts)...")
         close_result = place_order("buy", ORDER_SIZE, reduce_only=True)
@@ -215,8 +234,7 @@ def buy():
         print("✅ SHORT closed")
         time.sleep(0.5)
 
-    # Step 2: Open new LONG
-    print(f"🟢 Step 2/2 — Opening LONG ({ORDER_SIZE} contracts)...")
+    print(f"🟢 Opening LONG ({ORDER_SIZE} contracts)...")
     result = place_order("buy", ORDER_SIZE, reduce_only=False)
 
     if result and result.get("success"):
@@ -232,14 +250,13 @@ def buy():
 def sell():
     global current_position
 
-    # Always re-sync from exchange before acting — never trust in-memory state alone
+    # Always re-sync from exchange — never trust in-memory state after restart
     sync_position_from_exchange()
 
     if current_position == "SHORT":
         print("🔴 Already SHORT — skipping duplicate signal")
         return
 
-    # Step 1: Close existing LONG (reduce_only = never accidentally add to position)
     if current_position == "LONG":
         print(f"🔄 Step 1/2 — Closing LONG ({ORDER_SIZE} contracts)...")
         close_result = place_order("sell", ORDER_SIZE, reduce_only=True)
@@ -252,8 +269,7 @@ def sell():
         print("✅ LONG closed")
         time.sleep(0.5)
 
-    # Step 2: Open new SHORT
-    print(f"🔴 Step 2/2 — Opening SHORT ({ORDER_SIZE} contracts)...")
+    print(f"🔴 Opening SHORT ({ORDER_SIZE} contracts)...")
     result = place_order("sell", ORDER_SIZE, reduce_only=False)
 
     if result and result.get("success"):
