@@ -8,11 +8,11 @@ import os
 # ----------------- CONFIG -----------------
 API_KEY    = os.environ.get("API_KEY")
 API_SECRET = os.environ.get("API_SECRET")
-BASE_URL   = "https://api.india.delta.exchange"  # LIVE endpoint
-PRODUCT_ID = 27                                   # BTCUSD Perpetual (live)
+BASE_URL   = "https://api.india.delta.exchange"
+PRODUCT_ID = 27  # BTCUSD Perpetual (live)
 
-# ----------------- POSITION SIZING (10x LEVERAGE) -----------------
-ORDER_SIZE = 6
+# ----------------- POSITION SIZING -----------------
+ORDER_SIZE = 7
 
 # ----------------- POSITION STATE -----------------
 current_position = None
@@ -48,7 +48,22 @@ def make_request(method, path, body=None):
             response = requests.get(
                 BASE_URL + path, headers=headers, timeout=10
             )
-        return response.json()
+
+        # CRITICAL FIX: response.json() can raise if body is not valid JSON
+        # (HTML error page, empty body on 5xx, etc). Always guard it and
+        # print raw text so we can see what Delta actually returned.
+        try:
+            data = response.json()
+        except Exception:
+            print(f"⚠️ Non-JSON response [{response.status_code}]: {response.text[:300]}")
+            return {}
+
+        # Must be a dict — if Delta ever returns a list or string, catch it
+        if not isinstance(data, dict):
+            print(f"⚠️ Unexpected response type {type(data)}: {str(data)[:300]}")
+            return {}
+
+        return data
 
     except requests.exceptions.Timeout:
         print("❌ Request timed out")
@@ -65,36 +80,56 @@ def sync_position_from_exchange():
     global current_position
 
     print("🔄 Syncing position from Delta Exchange...")
-    result = make_request("GET", f"/v2/positions?product_id={PRODUCT_ID}")
 
-    try:
-        positions = result.get("result", [])
+    # Retry up to 3x — cold boot / network may not be ready instantly
+    for attempt in range(1, 4):
+        result = make_request("GET", f"/v2/positions?product_id={PRODUCT_ID}")
 
-        if not positions:
+        if not result:
+            print(f"⚠️ Sync attempt {attempt}/3 got empty response — retrying in 2s...")
+            time.sleep(2)
+            continue
+
+        try:
+            raw = result.get("result", [])
+
+            # Flat account: result is {}, [], or None
+            if not raw:
+                current_position = None
+                print("📊 Synced: No open position (flat)")
+                return
+
+            # Normalise: Delta sometimes returns a single dict instead of a list
+            positions = raw if isinstance(raw, list) else [raw]
+
+            for pos in positions:
+                if not isinstance(pos, dict):
+                    continue
+                size  = float(pos.get("size", 0))
+                side  = pos.get("side", "")
+                entry = pos.get("entry_price", "N/A")
+
+                if size > 0 and side == "buy":
+                    current_position = "LONG"
+                    print(f"📊 Synced: LONG | size={size} contracts | entry={entry}")
+                    return
+                elif size > 0 and side == "sell":
+                    current_position = "SHORT"
+                    print(f"📊 Synced: SHORT | size={size} contracts | entry={entry}")
+                    return
+
             current_position = None
             print("📊 Synced: No open position (flat)")
             return
 
-        for pos in positions:
-            size  = float(pos.get("size", 0))
-            side  = pos.get("side", "")
-            entry = pos.get("entry_price", "N/A")
+        except Exception as e:
+            print(f"⚠️ Sync parse error on attempt {attempt}/3: {e}")
+            print(f"   Raw result was: {str(result)[:300]}")
+            time.sleep(2)
 
-            if size > 0 and side == "buy":
-                current_position = "LONG"
-                print(f"📊 Synced: LONG | size={size} contracts | entry={entry}")
-                return
-            elif size > 0 and side == "sell":
-                current_position = "SHORT"
-                print(f"📊 Synced: SHORT | size={size} contracts | entry={entry}")
-                return
-
-        current_position = None
-        print("📊 Synced: No open position (flat)")
-
-    except Exception as e:
-        print(f"⚠️ Sync failed: {e} — defaulting to None")
-        current_position = None
+    print("❌ Sync failed after 3 attempts — defaulting to None")
+    print("   ⚠️ Check your API key, secret, and IP whitelist on Delta Exchange!")
+    current_position = None
 
 # Runs immediately when server boots
 sync_position_from_exchange()
@@ -104,7 +139,7 @@ def get_free_balance():
     result = make_request("GET", "/v2/wallet/balances")
     try:
         for b in result.get("result", []):
-            if b.get("asset_symbol") == "USD":
+            if isinstance(b, dict) and b.get("asset_symbol") == "USD":
                 available = float(b.get("available_balance", 0))
                 total     = float(b.get("balance", 0))
                 print(
@@ -116,14 +151,14 @@ def get_free_balance():
         print(f"⚠️ Balance fetch failed: {e}")
     return None
 
-# ----------------- PLACE ORDER (single direction) -----------------
+# ----------------- PLACE ORDER -----------------
 def place_order(side, size=ORDER_SIZE, reduce_only=False):
     body = {
         "product_id":  PRODUCT_ID,
         "order_type":  "market_order",
         "side":        side,
         "size":        size,
-        "reduce_only": reduce_only        # ← KEY: True = close only, never overshoots
+        "reduce_only": reduce_only
     }
     notional = round(size * 70.5, 2)
     margin   = round(size * 7.05, 2)
@@ -143,9 +178,9 @@ def place_order(side, size=ORDER_SIZE, reduce_only=False):
         pnl        = r.get("meta_data", {}).get("pnl", "0")
         print(f"✅ [{label}] Filled at: {fill_price} | PnL: {pnl} | Commission: {commission}")
     elif result:
-        error = result.get("error", {})
+        error = result.get("error", {}) or {}
         code  = error.get("code", "unknown")
-        ctx   = error.get("context", {})
+        ctx   = error.get("context", {}) or {}
         print(f"❌ [{label}] Failed — {code}")
         if code == "insufficient_margin":
             print(f"💡 Free: ${ctx.get('available_balance','?')} | Extra needed: ${ctx.get('required_additional_balance','?')}")
@@ -160,22 +195,25 @@ def place_order(side, size=ORDER_SIZE, reduce_only=False):
 def buy():
     global current_position
 
+    # Always re-sync from exchange before acting — never trust in-memory state alone
+    sync_position_from_exchange()
+
     if current_position == "LONG":
         print("🟢 Already LONG — skipping duplicate signal")
         return
 
-    # Step 1: Close existing SHORT first (reduce_only=True is safest)
+    # Step 1: Close existing SHORT (reduce_only = never accidentally add to position)
     if current_position == "SHORT":
         print(f"🔄 Step 1/2 — Closing SHORT ({ORDER_SIZE} contracts)...")
         close_result = place_order("buy", ORDER_SIZE, reduce_only=True)
 
         if not close_result.get("success"):
-            print("⚠️ Close SHORT failed — aborting. Re-syncing from Delta...")
+            print("⚠️ Close SHORT failed — aborting open. Re-syncing...")
             sync_position_from_exchange()
             return
 
-        print("✅ SHORT closed successfully")
-        time.sleep(0.5)   # small pause so exchange registers the close
+        print("✅ SHORT closed")
+        time.sleep(0.5)
 
     # Step 2: Open new LONG
     print(f"🟢 Step 2/2 — Opening LONG ({ORDER_SIZE} contracts)...")
@@ -185,7 +223,7 @@ def buy():
         current_position = "LONG"
         print(f"📊 Position: LONG | {ORDER_SIZE} contracts | Liq trigger: BTC -10%")
     else:
-        print("⚠️ Open LONG failed — re-syncing from Delta...")
+        print("⚠️ Open LONG failed — re-syncing...")
         sync_position_from_exchange()
 
     return result
@@ -194,22 +232,25 @@ def buy():
 def sell():
     global current_position
 
+    # Always re-sync from exchange before acting — never trust in-memory state alone
+    sync_position_from_exchange()
+
     if current_position == "SHORT":
         print("🔴 Already SHORT — skipping duplicate signal")
         return
 
-    # Step 1: Close existing LONG first (reduce_only=True is safest)
+    # Step 1: Close existing LONG (reduce_only = never accidentally add to position)
     if current_position == "LONG":
         print(f"🔄 Step 1/2 — Closing LONG ({ORDER_SIZE} contracts)...")
         close_result = place_order("sell", ORDER_SIZE, reduce_only=True)
 
         if not close_result.get("success"):
-            print("⚠️ Close LONG failed — aborting. Re-syncing from Delta...")
+            print("⚠️ Close LONG failed — aborting open. Re-syncing...")
             sync_position_from_exchange()
             return
 
-        print("✅ LONG closed successfully")
-        time.sleep(0.5)   # small pause so exchange registers the close
+        print("✅ LONG closed")
+        time.sleep(0.5)
 
     # Step 2: Open new SHORT
     print(f"🔴 Step 2/2 — Opening SHORT ({ORDER_SIZE} contracts)...")
@@ -219,7 +260,7 @@ def sell():
         current_position = "SHORT"
         print(f"📊 Position: SHORT | {ORDER_SIZE} contracts | Liq trigger: BTC +10%")
     else:
-        print("⚠️ Open SHORT failed — re-syncing from Delta...")
+        print("⚠️ Open SHORT failed — re-syncing...")
         sync_position_from_exchange()
 
     return result
@@ -229,7 +270,6 @@ def handle_signal(signal):
     signal = signal.strip().upper()
     print(f"\n{'='*60}")
     print(f"📩 Signal     : {signal}")
-    print(f"📊 Position   : {current_position}")
     print(f"📐 Size       : {ORDER_SIZE} contracts | 10x | LIVE | Rs.10,000")
     print(f"💸 Break-even : 0.118% BTC move (~Rs.46.52 round-trip fee)")
     print(f"🛡️  Liq safety : 10% BTC move needed to liquidate")
