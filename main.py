@@ -12,7 +12,7 @@ BASE_URL   = "https://api.india.delta.exchange"
 PRODUCT_ID = 27  # BTCUSD Perpetual (live)
 
 # ----------------- POSITION SIZING -----------------
-ORDER_SIZE = 9
+ORDER_SIZE = 13
 
 # ----------------- POSITION STATE -----------------
 current_position = None
